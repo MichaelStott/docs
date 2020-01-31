@@ -31,44 +31,6 @@ const config = {
 // redirectDomain is the domain to use when redirecting.
 const redirectDomain = config.redirectDomain || config.websiteDomain;
 
-// contentBucket stores the static content to be served via the CDN.
-const contentBucket = new aws.s3.Bucket(
-    "contentBucket",
-    {
-        bucket: config.targetDomain,
-        acl: "public-read",
-
-        // Have S3 serve its contents as if it were a website. This is how we get the right behavior
-        // for routes like "foo/", which S3 will automatically translate to "foo/index.html".
-        website: {
-            indexDocument: "index.html",
-            errorDocument: "404.html",
-        },
-    },
-    {
-        protect: false,
-    },
-);
-
-// contentBucket needs to have the "public-read" ACL so its contents can be ready by CloudFront and
-// served. But we deny the s3:ListBucket permission to prevent unintended disclosure of the bucket's
-// contents.
-const denyListPolicyState: aws.s3.BucketPolicyArgs = {
-    bucket: contentBucket.bucket,
-    policy: contentBucket.arn.apply((arn: string) => JSON.stringify({
-        Version: "2008-10-17",
-        Statement: [
-            {
-                Effect: "Deny",
-                Principal: "*",
-                Action: "s3:ListBucket",
-                Resource: arn,
-            },
-        ],
-    })),
-};
-const denyListPolicy = new aws.s3.BucketPolicy("deny-list", denyListPolicyState);
-
 // websiteBucket stores the static content to be served via the CDN.
 const websiteBucket = new aws.s3.Bucket(
     "website-bucket",
@@ -87,6 +49,25 @@ const websiteBucket = new aws.s3.Bucket(
         protect: false,
     },
 );
+
+// contentBucket needs to have the "public-read" ACL so its contents can be ready by CloudFront and
+// served. But we deny the s3:ListBucket permission to prevent unintended disclosure of the bucket's
+// contents.
+const denyListPolicyState: aws.s3.BucketPolicyArgs = {
+    bucket: websiteBucket.bucket,
+    policy: websiteBucket.arn.apply((arn: string) => JSON.stringify({
+        Version: "2008-10-17",
+        Statement: [
+            {
+                Effect: "Deny",
+                Principal: "*",
+                Action: "s3:ListBucket",
+                Resource: arn,
+            },
+        ],
+    })),
+};
+const denyListPolicy = new aws.s3.BucketPolicy("deny-list", denyListPolicyState);
 
 // archiveBucket receives uploaded tarballs of website builds.
 const archiveBucket = new aws.s3.Bucket("archive-bucket");
@@ -146,8 +127,9 @@ const logsBucket = new aws.s3.Bucket(
         acl: "private",
     },
     {
-        protect: true,
-    });
+        protect: false,
+    },
+);
 
 // websiteLogsBucket stores the request logs for incoming requests.
 const websiteLogsBucket = new aws.s3.Bucket(
@@ -312,23 +294,8 @@ const cdn = new aws.cloudfront.Distribution(
     {
         protect: true,
         dependsOn: [ websiteBucket, websiteLogsBucket ],
-    });
-
-// crawlDirectory recursive crawls the provided directory, applying the provided function
-// to every file it contains. Doesn't handle cycles from symlinks.
-function crawlDirectory(dir: string, f: (_: string) => void) {
-    const files = fs.readdirSync(dir);
-    for (const file of files) {
-        const filePath = `${dir}/${file}`;
-        const stat = fs.statSync(filePath);
-        if (stat.isDirectory()) {
-            crawlDirectory(filePath, f);
-        }
-        if (stat.isFile()) {
-            f(filePath);
-        }
-    }
-}
+    },
+);
 
 // Some files do not get the correct mime/type inferred from the mime package, and we
 // need to set our own.
@@ -345,47 +312,6 @@ function getMimeType(filePath: string): string | undefined {
 // Sync the contents of the source directory with the S3 bucket, which will in-turn show up on the CDN.
 const webContentsRootPath = path.join(process.cwd(), config.pathToWebsiteContents);
 console.log("Syncing contents from local disk at", webContentsRootPath);
-crawlDirectory(
-    webContentsRootPath,
-    (filePath: string) => {
-        const relativeFilePath = filePath.replace(webContentsRootPath + "/", "");
-
-        const baseArgs = {
-            acl: "public-read",
-            key: relativeFilePath,
-            bucket: contentBucket,
-        };
-
-        // Create a new S3 object for most files, but HTML files that contain a redirect
-        // just create a stubbed out S3 object with the right metadata so they return a
-        // 301 redirect (instead of serving the HTML with a meta-redirect). This ensures
-        // the right HTTP code response is returned for search engines, as well as
-        // enables better support for URL anchors.
-        const redirect = getMetaRefreshRedirect(filePath);
-        if (!redirect) {
-            const contentFile = new aws.s3.BucketObject(
-                relativeFilePath,
-                {
-                    ...baseArgs,
-                    source: new pulumi.asset.FileAsset(filePath),
-                    contentType: getMimeType(filePath) || undefined,
-                },
-                {
-                    parent: contentBucket,
-                });
-        } else {
-            const s3Redirect = new aws.s3.BucketObject(
-                relativeFilePath,
-                {
-                    ...baseArgs,
-                    source: new pulumi.asset.FileAsset("/dev/null"), // Empty file.
-                    websiteRedirect: translateRedirect(filePath, redirect),
-                },
-                {
-                    parent: contentBucket,
-                });
-        }
-    });
 
 // Returns the redirect URL if filePath is an HTML file that contains a meta refresh tag, otherwise undefined.
 function getMetaRefreshRedirect(filePath: string): string | undefined {
@@ -524,12 +450,8 @@ if (!pulumi.runtime.isDryRun()) {
     });
 }
 
-const aRecord = createAliasRecord(config.targetDomain, cdn);
 const aliasRecord = createAliasRecord(config.websiteDomain, cdn);
 
-export const contentBucketUri = contentBucket.bucket.apply(b => `s3://${b}`);
-export const contentBucketWebsiteDomain = contentBucket.websiteDomain;
-export const contentBucketWebsiteEndpoint = contentBucket.websiteEndpoint;
 export const websiteBucketUri = websiteBucket.bucket.apply(b => `s3://${b}`);
 export const websiteBucketWebsiteDomain = websiteBucket.websiteDomain;
 export const websiteBucketWebsiteEndpoint = websiteBucket.websiteEndpoint;
